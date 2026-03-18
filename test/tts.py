@@ -39,7 +39,6 @@ speech_headers = {
 }
 speech_payload = {
     'input': '你好呀',
-    #'voice_id': voices_list['邻家女孩'],
     'voice_id': '7426720361733046281',
     'response_format': 'wav'
 }
