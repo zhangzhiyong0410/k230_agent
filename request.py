@@ -179,6 +179,42 @@ def _to_body(data):
     return data.encode('utf-8')
 
 
+def _build_multipart(fields, files):
+    """
+    构造 multipart/form-data 请求体。
+
+    fields: dict，普通表单字段，例如 {"model": "xyz"}
+    files:  dict，文件字段，例如 {"file": ("speech.wav", b"...", "audio/wav")}
+
+    返回: (body_bytes, content_type_header)
+    """
+    boundary = '----K230Boundary9876543210'
+    parts = []
+
+    # 普通字段
+    if fields:
+        for key, value in fields.items():
+            parts.append(('--%s\r\n' % boundary).encode())
+            parts.append(('Content-Disposition: form-data; name="%s"\r\n\r\n' % key).encode())
+            parts.append(('%s\r\n' % value).encode())
+
+    # 文件字段
+    if files:
+        for field_name, file_info in files.items():
+            filename, file_data, mime = file_info
+            parts.append(('--%s\r\n' % boundary).encode())
+            parts.append(('Content-Disposition: form-data; name="%s"; filename="%s"\r\n' % (field_name, filename)).encode())
+            parts.append(('Content-Type: %s\r\n\r\n' % mime).encode())
+            parts.append(file_data)
+            parts.append(b'\r\n')
+
+    parts.append(('--%s--\r\n' % boundary).encode())
+
+    body = b''.join(parts)
+    content_type = 'multipart/form-data; boundary=%s' % boundary
+    return body, content_type
+
+
 def post(url, headers, data):
     return request(url, 'POST', headers, data)
 
@@ -236,10 +272,13 @@ def request(url, method, headers, data):
     if 'connection' not in headers_lower:
         req += "Connection: close\r\n"
     req += "\r\n"
+    print("start send request...")
+    start_time = time.ticks_ms()
     _sock_send(sock, req.encode('utf-8'))
     if body:
         _sock_send(sock, body)
-
+    print("send request time: ", time.ticks_diff(time.ticks_ms(), start_time))
+    print("start read response...")
     response = _read_response(sock)
     sock.close()
 
@@ -251,6 +290,7 @@ import network
 import time
 import json
 import audio
+from machine import Pin
 
 # 连接 WiFi
 sta = network.WLAN(0)
@@ -268,60 +308,150 @@ if not sta.isconnected():
 
 print("WiFi 已连接")
 
-
-
-# # 调用英语单词 API
-# url = "https://v2.xxapi.cn/api/englishwords"
-# headers = {
-#     "User-Agent": "K230-CanMV/1.0",
-#     "Accept": "application/json",
-# }
-# data = {"word": "cancel"}
-
+# Coze 相关配置
 authorization = 'Bearer pat_JrYrSPfHItMZUfpFEuwp3GEqqPM5OQXI5ftAqbYGd3XNSCVkBnuMTTpxBw79DfDc'
+bot_id = '7618103224301944847'
+user_id = '123456789'
 
-# voices_url = 'https://api.coze.cn/v1/audio/voices'
-# voices_headers = {
-#     'Authorization': authorization,
-#     'Content-Type': 'application/json'
-# }
-# voices_payload = {
-#     'filter_system_voice': False,
-#     'model_type': 'big',
-#     'page_num': 1,
-#     'page_size': 100
-# }
+asr_url = 'https://api.coze.cn/v1/audio/transcriptions'
+chat_url = 'https://api.coze.cn/v3/chat'
+tts_url = 'https://api.coze.cn/v1/audio/speech'
+voice_id = '7426720361753968677'  # 你喜欢的声音 ID，可按需调整
 
-# resp = get(voices_url, voices_headers, voices_payload)
-# voices_list = json.loads(resp.decode('utf-8'))
-# voices_dict = {}
-# for voice in voices_list['data']['voice_list']:
-#     voices_dict[voice['name']] = voice['voice_id']
-#     print(voice['name'], voice['voice_id'])
+def coze_chat(message_history):
+    """调用 Coze /v3/chat，流式 SSE，解析完整回复"""
+    payload = {
+        'bot_id': bot_id,
+        'user_id': user_id,
+        'stream': True,
+        'additional_messages': message_history,
+        'parameters': {}
+    }
+    headers = {
+        'Authorization': authorization,
+        'Content-Type': 'application/json'
+    }
+    resp = post(chat_url, headers, payload)
+    text = resp.decode('utf-8')
 
-# voice_id = voices_dict["魅力女友"]
+    # 解析 SSE 事件，提取最终 answer
+    answer = ''
+    event_type = ''
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith('event:'):
+            event_type = line[6:].strip()
+        elif line.startswith('data:'):
+            if event_type == 'conversation.message.delta':
+                try:
+                    data = json.loads(line[5:].strip())
+                    print(data.get('content', ''), end='')
+                except Exception as e:
+                    print('解析 SSE data 失败:', e)
+            elif event_type == 'conversation.message.completed':
+                try:
+                    data = json.loads(line[5:].strip())
+                    if data.get('type') == 'answer':
+                        answer = data.get('content', '')
+                except Exception as e:
+                    print('解析 SSE data 失败:', e)
+    print('\n')
+    return answer
 
-speech_url = 'https://api.coze.cn/v1/audio/speech'
-speech_headers = {
-    'Authorization': authorization,
-    'Content-Type': 'application/json'
-}
-speech_payload = {
-    'input': '你好',
-    'voice_id': '7426720361733013513',
-    'response_format': 'wav'
-}
+def tts_to_wav(text, filename):
+    """文本转语音，保存为 WAV 文件"""
+    headers = {
+        'Authorization': authorization,
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        'input': text,
+        'voice_id': voice_id,
+        'response_format': 'wav',
+        'sample_rate': 8000,
+        'loudness_rate': -50
+    }
+    resp = post(tts_url, headers, payload)
 
-resp = post(speech_url, speech_headers, speech_payload)
-print(len(resp))
+    with open(filename, 'wb') as f:
+        for i in range(0, len(resp), 1024):
+            f.write(resp[i:i+1024])
 
-with open('speech.wav', 'wb') as f:
-    for i in range(0, len(resp), 1024):
-        f.write(resp[i:i+1024])
+def asr_from_wav(filename):
+    """上传 WAV 到 Coze 做语音识别，返回文本"""
+    with open(filename, 'rb') as f:
+        wav_data = f.read()
 
-audio.play_audio('speech.wav')
+    body, content_type = _build_multipart(
+        fields=None,
+        files={'file': (filename, wav_data, 'audio/wav')},
+    )
 
-# 若 HTTPS 不支持，可尝试 HTTP（若 API 支持）
-# url_http = "http://v2.xxapi.cn/api/englishwords?word=cancel"
-# resp = get(url_http, headers)
-# print("响应:", resp.decode('utf-8'))
+    headers = {
+        'Authorization': authorization,
+        'Content-Type': content_type,
+    }
+
+    resp = post(asr_url, headers, body)
+    try:
+        data = json.loads(resp.decode('utf-8'))
+    except Exception as e:
+        print('解析 ASR 响应失败:', e, resp)
+        return ''
+
+    try:
+        return data['data']['text']
+    except Exception as e:
+        print('解析 ASR 响应失败:', e, data)
+        return ''
+
+def main_loop():
+    """asr-chatbot-tts 主循环：按键说话 -> 识别 -> 对话 -> 合成语音并播放"""
+    btn = Pin(21, Pin.IN, Pin.PULL_UP)
+    message_history = []
+
+    print('asr-chatbot-tts 已启动，按下按键开始说话...')
+
+    while True:
+        print('\n等待按键开始新一轮对话...')
+        # 不在这里等按键，直接调用已经支持按键控制的录音函数
+        audio.record_audio('/data/asr.wav', duration=None, btn=btn)
+
+        print('开始语音识别...')
+        user_text = asr_from_wav('/data/asr.wav')
+        if not user_text:
+            print('识别结果为空，跳过本轮。')
+            continue
+
+        print('识别结果:', user_text)
+
+        # 加入到对话历史
+        message_history.append({
+            'content': user_text,
+            'content_type': 'text',
+            'role': 'user',
+            'type': 'question'
+        })
+
+        print('发送到聊天机器人...')
+        answer = coze_chat(message_history)
+        if not answer:
+            print('机器人没有返回内容。')
+            continue
+
+        # 将机器人回答也加入历史，便于多轮对话
+        message_history.append({
+            'content': answer,
+            'content_type': 'text',
+            'role': 'assistant',
+            'type': 'answer'
+        })
+
+        print('开始语音合成并播放...')
+        tts_to_wav(answer, '/data/reply.wav')
+        audio.play_audio('/data/reply.wav')
+
+if __name__ == '__main__':
+    main_loop()
