@@ -87,9 +87,30 @@ def _urlencode(params):
     """将 dict 转为 URL 查询字符串，K230 无 urllib"""
     parts = []
     for k, v in params.items():
-        s = str(v).replace(' ', '%20').replace('&', '%26')
+        if v is True:
+            s = 'true'
+        elif v is False:
+            s = 'false'
+        else:
+            s = str(v).replace(' ', '%20').replace('&', '%26')
         parts.append(f"{k}={s}")
     return '&'.join(parts)
+
+
+def _to_body(data):
+    """将 data 转为 bytes：支持 dict(JSON)、str、bytes"""
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, dict):
+        try:
+            import json
+        except ImportError:
+            try:
+                import ujson as json
+            except ImportError:
+                raise ValueError('dict 需 json/ujson 模块序列化，当前平台可能不支持')
+        return json.dumps(data).encode('utf-8')
+    return data.encode('utf-8')
 
 
 def post(url, headers, data):
@@ -143,7 +164,7 @@ def request(url, method, headers, data):
         req += f"{key}: {value}\r\n"
     req += "\r\n"
 
-    body = data if isinstance(data, bytes) else data.encode('utf-8')
+    body = _to_body(data) if data is not None else b''
     _sock_send(sock, req.encode('utf-8'))
     if body:
         _sock_send(sock, body)
@@ -161,29 +182,44 @@ if __name__ == "__main__":
     # 连接 WiFi
     sta = network.WLAN(0)
     sta.active(True)
-    sta.connect("Kittenbot", "kittenbot428")
-
-    # 等待连接
-    for _ in range(20):
-        if sta.isconnected():
-            break
-        time.sleep(0.5)
-    else:
-        print("WiFi 连接超时")
-        raise SystemExit(1)
+    if not sta.isconnected():
+        sta.connect("706", "12345678")
+        # 等待连接
+        for _ in range(20):
+            if sta.isconnected():
+                break
+            time.sleep(0.5)
+        else:
+            print("WiFi 连接超时")
+            raise SystemExit(1)
 
     print("WiFi 已连接")
 
-    # 调用英语单词 API
-    url = "https://v2.xxapi.cn/api/englishwords"
-    headers = {
-        "User-Agent": "K230-CanMV/1.0",
-        "Accept": "application/json",
-    }
-    data = {"word": "cancel"}
 
+
+    # # 调用英语单词 API
+    # url = "https://v2.xxapi.cn/api/englishwords"
+    # headers = {
+    #     "User-Agent": "K230-CanMV/1.0",
+    #     "Accept": "application/json",
+    # }
+    # data = {"word": "cancel"}
+
+    authorization = 'Bearer pat_JrYrSPfHItMZUfpFEuwp3GEqqPM5OQXI5ftAqbYGd3XNSCVkBnuMTTpxBw79DfDc'
+
+    voices_url = 'https://api.coze.cn/v1/audio/voices'
+    voices_headers = {
+        'Authorization': authorization,
+        'Content-Type': 'application/json'
+    }
+    voices_payload = {
+        'filter_system_voice': False,
+        'model_type': 'big',
+        'page_num': 1,
+        'page_size': 100
+    }
     
-    resp = get(url, headers, params=data)
+    resp = get(voices_url, voices_headers, voices_payload)
     print("响应:", resp.decode('utf-8'))
     # 若 HTTPS 不支持，可尝试 HTTP（若 API 支持）
     # url_http = "http://v2.xxapi.cn/api/englishwords?word=cancel"
