@@ -1,4 +1,8 @@
 import socket
+import struct
+import _thread
+from media.pyaudio import *
+from media.media import *
 
 # K230/CanMV 平台：每次请求使用新 socket，避免复用已关闭的连接
 def _parse_url(url):
@@ -138,13 +142,134 @@ def _read_response(sock):
         if line.lower().startswith('content-length:'):
             content_length = int(line.split(':', 1)[1].strip())
             break
+    # print("content_length:",content_length)
+    # print("body:",body)
+    # print("body length:",len(body))
+
+
+    audio_play_module = False
+    BUFFER_SIZE = 0
+    CHUNK = 0
+    audio_data = None
+    p = None
+    stream = None
+    audio_lock = None
+    audio_state = None
+
+    if body [0:4] == b'RIFF':
+        audio_play_module = True
+        wFormatTag, nchannels, framerate, dwAvgBytesPerSec, wBlockAlign = struct.unpack('<HHLLH', body[0x14:0x14+14])
+        sampwidth = struct.unpack('<H', body[0x22:0x24])[0]
+        sampwidth = (sampwidth + 7) // 8
+
+        print("framerate:",framerate)
+        print("sampwidth:",sampwidth)
+        print("nchannels:",nchannels)
+        framesize = sampwidth * nchannels
+        CHUNK = int(framerate / 25)#960
+        BUFFER_SIZE = CHUNK * framesize#1920
+        # WAV PCM 数据区一般从 0x2c(44字节)开始；这里沿用原有偏移。
+        audio_data = bytearray(body[0x2c:])
+        p = PyAudio()
+        p.initialize(CHUNK)
+        MediaManager.init()
+        stream = p.open(format=p.get_format_from_width(sampwidth),
+                    channels=nchannels,
+                    rate=framerate,
+                    output=True,frames_per_buffer=CHUNK)
+        stream.volume(vol=85)
+
+        audio_lock = _thread.allocate_lock()
+        # 消费端用 pos 做“挪移”，避免频繁 audio_data=b'' 导致丢余量/重复拼接
+        audio_state = {'buf': audio_data, 'pos': 0, 'done': False}
+
+        max_bytes = BUFFER_SIZE * 8
+        compact_threshold = BUFFER_SIZE * 4
+
+        def _audio_playback_worker(_lock, _state, _stream, _p, _framesize, _buffer_size, _compact_threshold):
+            import time as _time
+            try:
+                while True:
+                    block = None
+                    with _lock:
+                        available = len(_state['buf']) - _state['pos']
+                        if available >= _buffer_size:
+                            block = bytes(_state['buf'][_state['pos']:_state['pos'] + _buffer_size])
+                            _state['pos'] += _buffer_size
+                            if _state['pos'] >= _compact_threshold:
+                                # Micropython 中 `bytearray` 切片删除不一定支持；
+                                # 用重切片替代“删除前缀”，避免抛异常。
+                                _state['buf'] = bytearray(_state['buf'][_state['pos']:])
+                                _state['pos'] = 0
+                        elif _state['done']:
+                            rem = len(_state['buf']) - _state['pos']
+                            if rem <= 0:
+                                break
+                            # 末尾数据按“整帧”刷新，避免写入半帧导致的噪声/卡顿
+                            rem_len = rem - (rem % _framesize)
+                            if rem_len > 0:
+                                block = bytes(_state['buf'][_state['pos']:_state['pos'] + rem_len])
+                                _state['pos'] += rem_len
+                                if _state['pos'] >= _compact_threshold:
+                                    _state['buf'] = bytearray(_state['buf'][_state['pos']:])
+                                    _state['pos'] = 0
+                            else:
+                                break
+
+                    if block:
+                        _stream.write(block)
+                    else:
+                        _time.sleep_ms(5)
+            except Exception as e:
+                print("audio playback thread error:", e)
+            finally:
+                # 在播放线程里做清理，避免主线程没法 join 导致提前 close
+                try:
+                    _stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    _stream.close()
+                except Exception:
+                    pass
+                try:
+                    _p.terminate()
+                except Exception:
+                    pass
+                try:
+                    MediaManager.deinit()
+                except Exception:
+                    pass
+
+        _thread.start_new_thread(
+            _audio_playback_worker,
+            (audio_lock, audio_state, stream, p, framesize, BUFFER_SIZE, compact_threshold),
+        )
+        import time as _time_main
 
     while content_length is not None and len(body) < content_length:
         need = content_length - len(body)
         chunk = _sock_recv(sock, min(512, need))
-        if not chunk:
-            break
-        body += chunk
+        if audio_play_module:
+            if not chunk:
+                break
+            while True:
+                with audio_lock:
+                    available = len(audio_state['buf']) - audio_state['pos']
+                    if available + len(chunk) <= max_bytes:
+                        audio_state['buf'].extend(chunk)
+                        break
+                # 缓冲太多，等待播放线程消费
+                _time_main.sleep_ms(5)
+        else:
+            if not chunk:
+                break
+            body += chunk
+
+    if audio_play_module and audio_state is not None:
+        # 通知播放线程：网络收包结束，可以把剩余缓冲刷完后退出
+        with audio_lock:
+            audio_state['done'] = True
 
     return body
 
@@ -360,7 +485,7 @@ def coze_chat(message_history):
     print('\n')
     return answer
 
-def tts_to_wav(text, filename):
+def tts_play(text, filename):
     """文本转语音，保存为 WAV 文件"""
     headers = {
         'Authorization': authorization,
@@ -450,8 +575,7 @@ def main_loop():
         })
 
         print('开始语音合成并播放...')
-        tts_to_wav(answer, '/data/reply.wav')
-        audio.play_audio('/data/reply.wav')
+        tts_play(answer, '/data/reply.wav')
 
 if __name__ == '__main__':
     main_loop()
