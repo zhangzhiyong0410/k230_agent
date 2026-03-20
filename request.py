@@ -414,7 +414,6 @@ def request(url, method, headers, data):
 import network
 import time
 import json
-import audio
 from machine import Pin
 
 # 连接 WiFi
@@ -532,6 +531,197 @@ def asr_from_wav(filename):
         print('解析 ASR 响应失败:', e, data)
         return ''
 
+def asr_realtime(btn):
+    """实时语音识别：录音线程采集音频，主线程同步建立连接并以 chunked 编码流式上传"""
+    FRAMERATE = 16000
+    SAMPWIDTH = 2
+    NCHANNELS = 1
+    CHUNK = FRAMERATE // 25
+    FRAMESIZE = SAMPWIDTH * NCHANNELS
+    BUFFER_SIZE = CHUNK * FRAMESIZE
+
+    boundary = '----K230Boundary9876543210'
+
+    print('按住按键说话...')
+    while btn.value() != 0:
+        time.sleep_ms(10)
+
+    # ---- 在主线程初始化录音硬件 ----
+    p = PyAudio()
+    p.initialize(CHUNK)
+    MediaManager.init()
+    stream = p.open(
+        format=paInt16,
+        channels=NCHANNELS,
+        rate=FRAMERATE,
+        input=True,
+        frames_per_buffer=CHUNK,
+    )
+    stream.volume(70, LEFT)
+    stream.volume(85, RIGHT)
+    stream.enable_audio3a(AUDIO_3A_ENABLE_ANS)
+
+    # 共享缓冲区
+    audio_lock = _thread.allocate_lock()
+    state = {'buf': bytearray(), 'pos': 0, 'done': False}
+    compact_threshold = BUFFER_SIZE * 4
+
+    def _record_worker(_lock, _state, _stream, _p, _btn):
+        import time as _t
+        try:
+            while _btn.value() == 0:
+                frame = _stream.read()
+                if frame:
+                    with _lock:
+                        _state['buf'].extend(frame)
+        except Exception as e:
+            print('录音线程异常:', e)
+        finally:
+            with _lock:
+                _state['done'] = True
+            try:
+                _stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                _stream.close()
+            except Exception:
+                pass
+            try:
+                _p.terminate()
+            except Exception:
+                pass
+            try:
+                MediaManager.deinit()
+            except Exception:
+                pass
+
+    _thread.start_new_thread(
+        _record_worker, (audio_lock, state, stream, p, btn)
+    )
+
+    # ---- 主线程：建立连接（与录音并行） ----
+    print('正在连接 ASR 服务器...')
+    start_time = time.ticks_ms()
+    scheme, host, port, path = _parse_url(asr_url)
+    use_ssl = (scheme == 'https')
+    ai = socket.getaddrinfo(host, port)
+    addr = ai[0][-1]
+
+    sock = socket.socket()
+    sock.settimeout(30)
+    sock.connect(addr)
+
+    if use_ssl:
+        try:
+            import ssl
+        except ImportError:
+            try:
+                import ussl as ssl
+            except ImportError:
+                sock.close()
+                raise OSError('HTTPS 需要 ssl/ussl 模块')
+        try:
+            sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_NONE, server_hostname=host)
+        except TypeError:
+            sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_NONE)
+
+    print('连接建立耗时: %d ms' % time.ticks_diff(time.ticks_ms(), start_time))
+
+    # ---- 发送 HTTP 请求头（chunked 编码） ----
+    content_type = 'multipart/form-data; boundary=%s' % boundary
+    req = 'POST %s HTTP/1.1\r\n' % path
+    req += 'Host: %s\r\n' % host
+    req += 'Authorization: %s\r\n' % authorization
+    req += 'Content-Type: %s\r\n' % content_type
+    req += 'Transfer-Encoding: chunked\r\n'
+    req += 'Connection: close\r\n'
+    req += '\r\n'
+    _sock_send(sock, req.encode('utf-8'))
+
+    def _send_chunk(data):
+        _sock_send(sock, ('%x\r\n' % len(data)).encode())
+        _sock_send(sock, data)
+        _sock_send(sock, b'\r\n')
+
+    # multipart 前导
+    preamble = ('--%s\r\n' % boundary).encode()
+    preamble += b'Content-Disposition: form-data; name="file"; filename="speech.wav"\r\n'
+    preamble += b'Content-Type: audio/wav\r\n\r\n'
+
+    # WAV 头（size 用占位值，服务端按实际数据长度解析）
+    wav_hdr = bytearray(44)
+    wav_hdr[0:4] = b'RIFF'
+    struct.pack_into('<I', wav_hdr, 4, 0x7FFFFFFF)
+    wav_hdr[8:12] = b'WAVE'
+    wav_hdr[12:16] = b'fmt '
+    struct.pack_into('<I', wav_hdr, 16, 16)
+    struct.pack_into('<H', wav_hdr, 20, 1)
+    struct.pack_into('<H', wav_hdr, 22, NCHANNELS)
+    struct.pack_into('<I', wav_hdr, 24, FRAMERATE)
+    struct.pack_into('<I', wav_hdr, 28, FRAMERATE * NCHANNELS * SAMPWIDTH)
+    struct.pack_into('<H', wav_hdr, 32, NCHANNELS * SAMPWIDTH)
+    struct.pack_into('<H', wav_hdr, 34, SAMPWIDTH * 8)
+    wav_hdr[36:40] = b'data'
+    struct.pack_into('<I', wav_hdr, 40, 0x7FFFFFFF)
+
+    _send_chunk(preamble + bytes(wav_hdr))
+
+    # ---- 边录边发 ----
+    total_sent = 0
+    while True:
+        chunk_data = None
+        done = False
+        with audio_lock:
+            available = len(state['buf']) - state['pos']
+            if available > 0:
+                chunk_data = bytes(state['buf'][state['pos']:])
+                state['pos'] += available
+                if state['pos'] >= compact_threshold:
+                    state['buf'] = bytearray(state['buf'][state['pos']:])
+                    state['pos'] = 0
+            done = state['done']
+
+        if chunk_data:
+            _send_chunk(chunk_data)
+            total_sent += len(chunk_data)
+        elif done:
+            with audio_lock:
+                remaining = len(state['buf']) - state['pos']
+                if remaining > 0:
+                    chunk_data = bytes(state['buf'][state['pos']:])
+            if chunk_data:
+                _send_chunk(chunk_data)
+                total_sent += len(chunk_data)
+            break
+        else:
+            time.sleep_ms(10)
+
+    print('录音结束，共发送 %d 字节音频数据' % total_sent)
+
+    # multipart 结束标记
+    epilogue = ('\r\n--%s--\r\n' % boundary).encode()
+    _send_chunk(epilogue)
+
+    # chunked 编码终止符
+    _sock_send(sock, b'0\r\n\r\n')
+
+    # ---- 读取并解析响应 ----
+    response = _read_response(sock)
+    sock.close()
+
+    try:
+        result = json.loads(response.decode('utf-8'))
+    except Exception as e:
+        print('解析 ASR 响应失败:', e, response)
+        return ''
+
+    try:
+        return result['data']['text']
+    except Exception as e:
+        print('解析 ASR 响应失败:', e, result)
+        return ''
+
 def main_loop():
     """asr-chatbot-tts 主循环：按键说话 -> 识别 -> 对话 -> 合成语音并播放"""
     btn = Pin(21, Pin.IN, Pin.PULL_UP)
@@ -541,11 +731,9 @@ def main_loop():
 
     while True:
         print('\n等待按键开始新一轮对话...')
-        # 不在这里等按键，直接调用已经支持按键控制的录音函数
-        audio.record_audio('/data/asr.wav', duration=None, btn=btn)
 
-        print('开始语音识别...')
-        user_text = asr_from_wav('/data/asr.wav')
+        print('开始实时语音识别...')
+        user_text = asr_realtime(btn)
         if not user_text:
             print('识别结果为空，跳过本轮。')
             continue
