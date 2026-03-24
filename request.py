@@ -1,4 +1,5 @@
 import socket
+import time
 import struct
 import _thread
 from media.pyaudio import *
@@ -50,6 +51,7 @@ def play_audio(filename):
             data = wf.read_frames(CHUNK) #从wav文件中读取数一帧数据
             if btn.value() == 0:
                 print("按键退出")
+                time.sleep(0.3)
                 break
     except BaseException as e:
             import sys
@@ -133,10 +135,8 @@ def _sock_recv(sock, n, _retries=50):
             if d is not None and len(d) > 0:
                 return d
             try:
-                import time
                 time.sleep_ms(100)
             except Exception:
-                import time
                 time.sleep(0.1)
         return b''
     return sock.recv(n)
@@ -201,6 +201,7 @@ def _read_chunked_sse_chat(sock, initial=b''):
             buf = buf[index+1:]
 
         for data_line in data_lines:
+            #print("sse line:", data_line)
             if not data_line:
                 continue
             # print("sse line:", data_line)
@@ -289,8 +290,7 @@ def _read_chunked_sse_chat(sock, initial=b''):
                             submit_outputs.append({
                                 'tool_call_id': tool_call_id,
                                 'output': json.dumps(
-                                    {'response': '成功打印了文本：' + (text or '')},
-                                    ensure_ascii=False
+                                    {'response': '成功打印了文本：' + (text or '')}
                                 )
                             })
                         elif tool_name == 'play_music':
@@ -652,21 +652,21 @@ def _build_multipart(fields, files):
     return body, content_type
 
 
-def post(url, headers, data):
-    return request(url, 'POST', headers, data)
+def post(url, headers, data, timeout=5):
+    return request(url, 'POST', headers, data, timeout)
 
 
-def get(url, headers=None, params=None):
+def get(url, headers=None, params=None, timeout=5):
     if headers is None:
         headers = {}
     data = ''
     if params:
         qs = _urlencode(params)
         url = url + ('&' if '?' in url else '?') + qs
-    return request(url, 'GET', headers, data)
+    return request(url, 'GET', headers, data, timeout)
 
 
-def request(url, method, headers, data):
+def request(url, method, headers, data, timeout=5):
     if headers is None:
         headers = {}
 
@@ -678,7 +678,7 @@ def request(url, method, headers, data):
     addr = ai[0][-1]
 
     sock = socket.socket()
-    sock.settimeout(5)
+    sock.settimeout(timeout)
     sock.connect(addr)
 
     if use_ssl:
@@ -798,7 +798,7 @@ def tts_play(text):
         'sample_rate': 8000,
         'loudness_rate': -50
     }
-    post(tts_url, headers, payload)
+    post(tts_url, headers, payload, timeout=3)
 
     # with open(filename, 'wb') as f:
     #     for i in range(0, len(resp), 1024):
