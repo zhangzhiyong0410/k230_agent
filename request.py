@@ -4,7 +4,13 @@ import _thread
 from media.pyaudio import *
 from media.media import *
 from media.display import *
+import media.wave as wave
 import json
+from machine import Pin
+import os
+import random
+
+btn = Pin(21, Pin.IN, Pin.PULL_UP)
 
 DISPLAY_WIDTH = ALIGN_UP(800, 16)
 DISPLAY_HEIGHT = 480
@@ -19,6 +25,40 @@ LCD_MAX_CHARS_PER_LINE = 40
 # chat（SSE 增量回复）从 LCD 的第几行开始绘制。
 # main_loop 在显示识别结果后会设置这个值，这样“识别结果”和“回复内容”可以同屏。
 LCD_REPLY_START_LINE = 0
+
+def play_audio(filename):
+
+    try:
+        wf = wave.open(filename, 'rb')#打开wav文件
+        CHUNK = int(wf.get_framerate()/25)#设置音频chunk值
+
+        p = PyAudio()
+
+        #创建音频输出流，设置的音频参数均为wave中获取到的参数
+        stream = p.open(format=p.get_format_from_width(wf.get_sampwidth()),
+                    channels=wf.get_channels(),
+                    rate=wf.get_framerate(),
+                    output=True,frames_per_buffer=CHUNK)
+
+        #设置音频输出流的音量
+        stream.volume(vol=85)
+
+        data = wf.read_frames(CHUNK)#从wav文件中读取数一帧数据
+
+        while data:
+            stream.write(data)  #将帧数据写入到音频输出流中
+            data = wf.read_frames(CHUNK) #从wav文件中读取数一帧数据
+            if btn.value() == 0:
+                print("按键退出")
+                break
+    except BaseException as e:
+            import sys
+            sys.print_exception(e)
+    finally:
+        stream.stop_stream() #停止音频输出流
+        stream.close()#关闭音频输出流
+        p.terminate()#释放音频对象
+        wf.close()#关闭wav文件
 
 def _wrap_text_by_chars(text, max_chars_per_line=LCD_MAX_CHARS_PER_LINE):
     """把长文本按固定字符数切成多行，供 LCD 多行绘制使用。"""
@@ -175,6 +215,8 @@ def _read_chunked_sse_chat(sock, initial=b''):
                     # 非预期的 data 行，跳过继续等下一条事件
                     continue
                 if event_type == b'conversation.message.delta':
+                    if data_content.get('type') != 'answer':
+                        continue
                     content = data_content.get('content', '')
                     if content:
                         # 边收边显示：只打印增量，避免 \r 在部分终端/日志里变成换行
@@ -204,10 +246,92 @@ def _read_chunked_sse_chat(sock, initial=b''):
                         Display.show_image(img)
                         print(content, end='')
                 elif event_type == b'conversation.message.completed':
-                    # completed 事件里可能还带 type 字段，统一返回 answer 的 content
-                    # completed 后补一个换行，让控制台/日志更整洁
-                    print()
-                    return data_content.get('content', '') or full_answer
+                    # 仅在 answer 完成时返回；忽略 tool_response/follow_up 等
+                    if data_content.get('type') == 'answer':
+                        print()
+                        return data_content.get('content', '') or full_answer
+                elif event_type == b'conversation.chat.requires_action':
+                    required = data_content.get('required_action', {})
+                    submit_meta = required.get('submit_tool_outputs', {})
+                    tool_calls = submit_meta.get('tool_calls', []) or []
+                    conversation_id = data_content.get('conversation_id', '')
+                    chat_id = data_content.get('id', '')
+                    if not conversation_id or not chat_id or not tool_calls:
+                        continue
+
+                    submit_headers = {
+                        'Authorization': authorization,
+                        'Content-Type': 'application/json'
+                    }
+                    submit_url = (
+                        'https://api.coze.cn/v3/chat/submit_tool_outputs'
+                        + '?conversation_id=' + str(conversation_id)
+                        + '&chat_id=' + str(chat_id)
+                    )
+                    submit_outputs = []
+                    for tool_call in tool_calls:
+                        tool_call_id = tool_call.get('id', '')
+                        function = tool_call.get('function', {}) or {}
+                        if not tool_call_id:
+                            continue
+
+                        tool_name = function.get('name', '')
+                        args = function.get('arguments', '{}')
+                        try:
+                            args_json = json.loads(args) if isinstance(args, str) else args
+                        except Exception:
+                            args_json = {}
+
+                        if tool_name == 'print':
+                            text = args_json.get('text', '')
+                            if text:
+                                print("收到工具调用：" + text)
+                            submit_outputs.append({
+                                'tool_call_id': tool_call_id,
+                                'output': json.dumps(
+                                    {'response': '成功打印了文本：' + (text or '')},
+                                    ensure_ascii=False
+                                )
+                            })
+                        elif tool_name == 'play_music':
+                            music_result = '音乐播放完毕'
+                            try:
+                                print("收到工具调用：播放音乐")
+                                music_dir = '/data/yinyue'
+                                file_list = os.listdir(music_dir)
+                                if file_list:
+                                    picked = random.choice(file_list)
+                                    play_audio(music_dir + '/' + picked)
+                                    music_result = '音乐播放完毕：' + picked
+                                else:
+                                    music_result = '音乐目录为空，未播放'
+                            except Exception as e:
+                                music_result = '播放失败：' + str(e)
+                            submit_outputs.append({
+                                'tool_call_id': tool_call_id,
+                                'output': json.dumps(
+                                    {'response': music_result}
+                                )
+                            })
+                        else:
+                            submit_outputs.append({
+                                'tool_call_id': tool_call_id,
+                                'output': json.dumps(
+                                    {'response': '未实现工具：' + str(tool_name)}
+                                )
+                            })
+
+                    if not submit_outputs:
+                        continue
+
+                    submit_payload = {
+                        'stream': True,
+                        'auto_save_history': True,
+                        'tool_outputs': submit_outputs
+                    }
+                    submit_answer = post(submit_url, submit_headers, submit_payload)
+                    if submit_answer:
+                        return submit_answer
 
 
 def _read_chunked_raw(sock, initial=b''):
@@ -898,7 +1022,6 @@ def asr_realtime(btn):
 
 def main_loop():
     """asr-chatbot-tts 主循环：按键说话 -> 识别 -> 对话 -> 合成语音并播放"""
-    btn = Pin(21, Pin.IN, Pin.PULL_UP)
     message_history = []
     global LCD_REPLY_START_LINE
 
@@ -958,4 +1081,4 @@ if __name__ == '__main__':
     #     'role': 'user',
     #     'type': 'question'
     # })    
-    # coze_chat(message_history)
+    # tts_play("你好")
