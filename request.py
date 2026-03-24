@@ -3,6 +3,49 @@ import struct
 import _thread
 from media.pyaudio import *
 from media.media import *
+from media.display import *
+import json
+
+DISPLAY_WIDTH = ALIGN_UP(800, 16)
+DISPLAY_HEIGHT = 480
+
+LCD_FONT_SIZE = 20
+LCD_LINE_HEIGHT = 24
+LCD_TEXT_COLOR = (255, 255, 255)
+LCD_MAX_LINES = DISPLAY_HEIGHT // LCD_LINE_HEIGHT
+
+LCD_MAX_CHARS_PER_LINE = 40
+
+# chat（SSE 增量回复）从 LCD 的第几行开始绘制。
+# main_loop 在显示识别结果后会设置这个值，这样“识别结果”和“回复内容”可以同屏。
+LCD_REPLY_START_LINE = 0
+
+def _wrap_text_by_chars(text, max_chars_per_line=LCD_MAX_CHARS_PER_LINE):
+    """把长文本按固定字符数切成多行，供 LCD 多行绘制使用。"""
+    if text is None:
+        return []
+    # 替换换行，避免出现意外的行空白
+    text = str(text).replace('\r', '').replace('\n', ' ')
+    if not text:
+        return []
+    return [text[i:i + max_chars_per_line] for i in range(0, len(text), max_chars_per_line)]
+
+def _lcd_show_lines(lines):
+    """在 LCD 上显示 1~n 行提示信息（用于状态引导）"""
+    img.clear()
+    y = 0
+    for i in range(min(len(lines), LCD_MAX_LINES)):
+        s = lines[i]
+        if not s:
+            continue
+        img.draw_string_advanced(0, y, LCD_FONT_SIZE, s, color=LCD_TEXT_COLOR)
+        y += LCD_LINE_HEIGHT
+    Display.show_image(img)
+
+
+img = image.Image(DISPLAY_WIDTH, DISPLAY_HEIGHT, image.ARGB8888)
+# use lcd as display output
+Display.init(Display.ST7701, width = DISPLAY_WIDTH, height = DISPLAY_HEIGHT, to_ide = True)
 
 # K230/CanMV 平台：每次请求使用新 socket，避免复用已关闭的连接
 def _parse_url(url):
@@ -67,25 +110,136 @@ def _sock_send(sock, data):
         sock.send(data)
 
 
-def _read_chunked(sock, initial=b''):
-    """解析 Transfer-Encoding: chunked 格式的 body"""
+def _read_chunked_sse_chat(sock, initial=b''):
+    """解析 chat 的 SSE（Transfer-Encoding: chunked）增量消息"""
+    buf = initial
+    # SSE 一次事件由多行组成（event:/data: 等），需要边收边按行处理
+    event_type = None
+    full_answer = ''
+    # LCD 增量绘制参数：每次只画“新收到的 content”
+    max_chars_per_line = 40
+    font_size = LCD_FONT_SIZE
+    line_height = LCD_LINE_HEIGHT  # 与 font_size 对齐的经验值，避免重叠
+    max_lines = DISPLAY_HEIGHT // line_height
+    cell_width = DISPLAY_WIDTH // max_chars_per_line
+
+    # 预留标题行：根据 main_loop 传入的起始行，在“识别结果”后开始展示回复
+    reply_start_line = LCD_REPLY_START_LINE
+    if reply_start_line <= 0:
+        # 未设置时，兼容旧行为：清屏并从第 0 行开始显示回复
+        img.clear()
+        reply_start_line = 0
+
+    # 标题行
+    title_line = reply_start_line
+    img.draw_string_advanced(
+        0,
+        title_line * line_height,
+        font_size,
+        "回复中...",
+        color=LCD_TEXT_COLOR,
+    )
+
+    # 光标从标题下一行开始
+    cursor_line = title_line + 1
+    cursor_col = 0
+    cursor_x = 0
+    cursor_y = cursor_line * line_height
+    Display.show_image(img)
+    while True:
+        data_lines = []
+        c = _sock_recv(sock, 512)
+        if not c:
+            break
+        buf += c
+
+        while True:
+            index = buf.find(b'\n')
+            if index == -1:
+                break
+            data_lines.append(buf[:index])
+            buf = buf[index+1:]
+
+        for data_line in data_lines:
+            if not data_line:
+                continue
+            # print("sse line:", data_line)
+            if data_line.startswith(b'event:'):
+                event_type = data_line[6:].strip()
+            elif data_line.startswith(b'data:'):
+                # data: 后面是一个 json 行，可能带 \r\n，先 strip 掉
+                payload = data_line[5:].strip()
+                try:
+                    data_content = json.loads(payload)
+                except Exception:
+                    # 非预期的 data 行，跳过继续等下一条事件
+                    continue
+                if event_type == b'conversation.message.delta':
+                    content = data_content.get('content', '')
+                    if content:
+                        # 边收边显示：只打印增量，避免 \r 在部分终端/日志里变成换行
+                        full_answer += content
+                        # 按当前 cursor(x,y) 增量绘制，超出当行字数则换行
+                        left = content
+                        while left:
+                            if cursor_line >= max_lines:
+                                # 屏幕满了：不再绘制新内容，仍继续接收网络数据
+                                break
+                            remaining_in_line = max_chars_per_line - cursor_col
+                            if remaining_in_line <= 0:
+                                cursor_line += 1
+                                cursor_col = 0
+                                cursor_x = 0
+                                cursor_y = cursor_line * line_height
+                                continue
+
+                            take = min(len(left), remaining_in_line)
+                            part = left[:take]
+                            if part:
+                                img.draw_string_advanced(cursor_x, cursor_y, font_size, part, color=(255, 255, 255))
+                            cursor_col += take
+                            cursor_x = cursor_col * cell_width
+                            left = left[take:]
+
+                        Display.show_image(img)
+                        print(content, end='')
+                elif event_type == b'conversation.message.completed':
+                    # completed 事件里可能还带 type 字段，统一返回 answer 的 content
+                    # completed 后补一个换行，让控制台/日志更整洁
+                    print()
+                    return data_content.get('content', '') or full_answer
+
+
+def _read_chunked_raw(sock, initial=b''):
+    """按 HTTP/1.1 标准解码 Transfer-Encoding: chunked，并返回原始 body bytes"""
     body = b''
     buf = initial
     while True:
-        # 读取到 \r\n 得到 chunk size 行
+        # 读取 chunk size 行：直到出现 \r\n
         while b'\r\n' not in buf:
             c = _sock_recv(sock, 64)
             if not c:
                 return body
             buf += c
+
         line, buf = buf.split(b'\r\n', 1)
         size_hex = line.decode('ascii', 'ignore').split(';')[0].strip()
         try:
             chunk_size = int(size_hex, 16)
         except ValueError:
             return body
+
         if chunk_size == 0:
+            # 0\r\n\r\n 后面可能还有 trailer，这里至少把后续的 \r\n 吃掉
+            while len(buf) < 2:
+                c = _sock_recv(sock, 2 - len(buf))
+                if not c:
+                    return body
+                buf += c
+            if buf[:2] == b'\r\n':
+                buf = buf[2:]
             break
+
         # 读取 chunk 数据
         got = 0
         while got < chunk_size:
@@ -100,13 +254,15 @@ def _read_chunked(sock, initial=b''):
                 if not c:
                     return body
                 buf = c
-        # 吃掉 chunk 后的 \r\n
+
+        # 吃掉 chunk 末尾的 \r\n
         while len(buf) < 2:
             c = _sock_recv(sock, 2 - len(buf))
             if not c:
                 return body
             buf += c
         buf = buf[2:]
+
     return body
 
 
@@ -127,14 +283,26 @@ def _read_response(sock):
 
     # 解析 Transfer-Encoding
     chunked = False
+    content_type = ''
     for line in headers_str.split('\r\n'):
         if line.lower().startswith('transfer-encoding:'):
             if 'chunked' in line.lower():
                 chunked = True
             break
 
+    for line in headers_str.split('\r\n'):
+        if line.lower().startswith('content-type:'):
+            content_type = line.split(':', 1)[1].strip().lower()
+            break
+
+    is_event_stream = ('event-stream' in content_type)
+
     if chunked:
-        return _read_chunked(sock, body)
+        # 只在 SSE/chat 场景下按事件解析；其它 chunked 返回原始 bytes，避免误影响其它流式输出
+        looks_like_sse = (b'event:' in body[:256] or b'data:' in body[:256])
+        if is_event_stream or looks_like_sse:
+            return _read_chunked_sse_chat(sock, body)
+        return _read_chunked_raw(sock, body)
 
     # 解析 Content-Length
     content_length = None
@@ -155,24 +323,48 @@ def _read_response(sock):
     stream = None
     audio_lock = None
     audio_state = None
-
-    if body [0:4] == b'RIFF':
+    if body[0:4] == b'RIFF':
         audio_play_module = True
-        wFormatTag, nchannels, framerate, dwAvgBytesPerSec, wBlockAlign = struct.unpack('<HHLLH', body[0x14:0x14+14])
+        # 兼容首包不完整：WAV PCM 头固定至少 44 字节（RIFF/WAVE/fmt/data）
+        WAV_HEADER_MIN = 0x2c  # 44
+        if len(body) < WAV_HEADER_MIN:
+            #print("首次接收到的WAV头不完整，需要继续接收")
+            # content_length 可能存在也可能不存在；有则不超过，避免阻塞到多余数据
+            remain = None
+            if content_length is not None:
+                remain = max(0, content_length - len(body))
+            need = WAV_HEADER_MIN - len(body)
+            if remain is not None:
+                need = min(need, remain)
+            while need > 0:
+                chunk = _sock_recv(sock, min(512, need))
+                if not chunk:
+                    break
+                body += chunk
+                need = WAV_HEADER_MIN - len(body)
+
+        if len(body) < WAV_HEADER_MIN:
+            print(f"wav header not enough, len:{len(body)} body:{body[:64]}")
+            print("语音合成失败已跳过")
+            return None
+        try:
+            wFormatTag, nchannels, framerate, dwAvgBytesPerSec, wBlockAlign = struct.unpack('<HHLLH', body[0x14:0x14+14])
+        except ValueError as e:
+            print(f"wav file error:{e},len:{len(body)},body:{body}")
+            print("语音合成失败已跳过")
+            return None
         sampwidth = struct.unpack('<H', body[0x22:0x24])[0]
         sampwidth = (sampwidth + 7) // 8
 
-        print("framerate:",framerate)
-        print("sampwidth:",sampwidth)
-        print("nchannels:",nchannels)
+        # print("framerate:",framerate)
+        # print("sampwidth:",sampwidth)
+        # print("nchannels:",nchannels)
         framesize = sampwidth * nchannels
         CHUNK = int(framerate / 25)#960
         BUFFER_SIZE = CHUNK * framesize#1920
         # WAV PCM 数据区一般从 0x2c(44字节)开始；这里沿用原有偏移。
         audio_data = bytearray(body[0x2c:])
         p = PyAudio()
-        p.initialize(CHUNK)
-        MediaManager.init()
         stream = p.open(format=p.get_format_from_width(sampwidth),
                     channels=nchannels,
                     rate=framerate,
@@ -234,10 +426,6 @@ def _read_response(sock):
                     pass
                 try:
                     _p.terminate()
-                except Exception:
-                    pass
-                try:
-                    MediaManager.deinit()
                 except Exception:
                     pass
 
@@ -366,7 +554,7 @@ def request(url, method, headers, data):
     addr = ai[0][-1]
 
     sock = socket.socket()
-    sock.settimeout(30)
+    sock.settimeout(5)
     sock.connect(addr)
 
     if use_ssl:
@@ -397,13 +585,13 @@ def request(url, method, headers, data):
     if 'connection' not in headers_lower:
         req += "Connection: close\r\n"
     req += "\r\n"
-    print("start send request...")
-    start_time = time.ticks_ms()
+    # print("start send request...")
+    # start_time = time.ticks_ms()
     _sock_send(sock, req.encode('utf-8'))
     if body:
         _sock_send(sock, body)
-    print("send request time: ", time.ticks_diff(time.ticks_ms(), start_time))
-    print("start read response...")
+    # print("send request time: ", time.ticks_diff(time.ticks_ms(), start_time))
+    # print("start read response...")
     response = _read_response(sock)
     sock.close()
 
@@ -420,22 +608,37 @@ from machine import Pin
 sta = network.WLAN(0)
 sta.active(True)
 if not sta.isconnected():
-    sta.connect("706", "12345678")
+    _lcd_show_lines(["WiFi连接中", "正在尝试"])
     # 等待连接
-    for _ in range(20):
+    for i in range(20):
+        _lcd_show_lines(["WiFi连接中", "尝试 %d/20" % (i + 1)])
+        # 有些固件/网络状态下，单次 connect 后 isconnected 可能不会及时刷新；
+        # 这里按你的描述：每次尝试都 connect 一次，然后立刻检查状态。
+        try:
+            sta.connect("706", "12345678")
+        except Exception:
+            pass
         if sta.isconnected():
             break
         time.sleep(0.5)
     else:
+        _lcd_show_lines(["WiFi连接超时", "请检查网络"])
         print("WiFi 连接超时")
         raise SystemExit(1)
 
-print("WiFi 已连接")
+try:
+    cfg = sta.ifconfig()
+    ip = cfg[0] if cfg else ''
+except Exception:
+    ip = ''
+
+_lcd_show_lines(["WiFi已连接", ip[:40]])
+print("WiFi 已连接", ip)
 
 # Coze 相关配置
 authorization = 'Bearer pat_JrYrSPfHItMZUfpFEuwp3GEqqPM5OQXI5ftAqbYGd3XNSCVkBnuMTTpxBw79DfDc'
 bot_id = '7618103224301944847'
-user_id = '123456789'
+user_id = 'k230_zy'
 
 asr_url = 'https://api.coze.cn/v1/audio/transcriptions'
 chat_url = 'https://api.coze.cn/v3/chat'
@@ -456,35 +659,9 @@ def coze_chat(message_history):
         'Content-Type': 'application/json'
     }
     resp = post(chat_url, headers, payload)
-    text = resp.decode('utf-8')
+    return resp
 
-    # 解析 SSE 事件，提取最终 answer
-    answer = ''
-    event_type = ''
-    for line in text.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith('event:'):
-            event_type = line[6:].strip()
-        elif line.startswith('data:'):
-            if event_type == 'conversation.message.delta':
-                try:
-                    data = json.loads(line[5:].strip())
-                    print(data.get('content', ''), end='')
-                except Exception as e:
-                    print('解析 SSE data 失败:', e)
-            elif event_type == 'conversation.message.completed':
-                try:
-                    data = json.loads(line[5:].strip())
-                    if data.get('type') == 'answer':
-                        answer = data.get('content', '')
-                except Exception as e:
-                    print('解析 SSE data 失败:', e)
-    print('\n')
-    return answer
-
-def tts_play(text, filename):
+def tts_play(text):
     """文本转语音，保存为 WAV 文件"""
     headers = {
         'Authorization': authorization,
@@ -497,11 +674,11 @@ def tts_play(text, filename):
         'sample_rate': 8000,
         'loudness_rate': -50
     }
-    resp = post(tts_url, headers, payload)
+    post(tts_url, headers, payload)
 
-    with open(filename, 'wb') as f:
-        for i in range(0, len(resp), 1024):
-            f.write(resp[i:i+1024])
+    # with open(filename, 'wb') as f:
+    #     for i in range(0, len(resp), 1024):
+    #         f.write(resp[i:i+1024])
 
 def asr_from_wav(filename):
     """上传 WAV 到 Coze 做语音识别，返回文本"""
@@ -543,13 +720,13 @@ def asr_realtime(btn):
     boundary = '----K230Boundary9876543210'
 
     print('按住按键说话...')
+    _lcd_show_lines(["按住按键说话...", "松开结束录音"])
     while btn.value() != 0:
         time.sleep_ms(10)
 
     # ---- 在主线程初始化录音硬件 ----
+    _lcd_show_lines(["录音中...", "正在采集语音"])
     p = PyAudio()
-    p.initialize(CHUNK)
-    MediaManager.init()
     stream = p.open(
         format=paInt16,
         channels=NCHANNELS,
@@ -591,10 +768,6 @@ def asr_realtime(btn):
                 _p.terminate()
             except Exception:
                 pass
-            try:
-                MediaManager.deinit()
-            except Exception:
-                pass
 
     _thread.start_new_thread(
         _record_worker, (audio_lock, state, stream, p, btn)
@@ -602,6 +775,7 @@ def asr_realtime(btn):
 
     # ---- 主线程：建立连接（与录音并行） ----
     print('正在连接 ASR 服务器...')
+    _lcd_show_lines(["识别中...", "连接并上传音频"])
     start_time = time.ticks_ms()
     scheme, host, port, path = _parse_url(asr_url)
     use_ssl = (scheme == 'https')
@@ -609,7 +783,7 @@ def asr_realtime(btn):
     addr = ai[0][-1]
 
     sock = socket.socket()
-    sock.settimeout(30)
+    sock.settimeout(5)
     sock.connect(addr)
 
     if use_ssl:
@@ -726,11 +900,14 @@ def main_loop():
     """asr-chatbot-tts 主循环：按键说话 -> 识别 -> 对话 -> 合成语音并播放"""
     btn = Pin(21, Pin.IN, Pin.PULL_UP)
     message_history = []
+    global LCD_REPLY_START_LINE
 
     print('asr-chatbot-tts 已启动，按下按键开始说话...')
+    _lcd_show_lines(["已启动", "等待按键开始"])
 
     while True:
         print('\n等待按键开始新一轮对话...')
+        _lcd_show_lines(["等待按键...", "按下开始说话"])
 
         print('开始实时语音识别...')
         user_text = asr_realtime(btn)
@@ -739,6 +916,14 @@ def main_loop():
             continue
 
         print('识别结果:', user_text)
+        user_lines = _wrap_text_by_chars(user_text, LCD_MAX_CHARS_PER_LINE)
+        # 让“识别结果”和“回复内容”同屏：回复标题/正文从识别结果下方开始绘制
+        max_header_lines = max(0, LCD_MAX_LINES - 2)  # 预留 1 行“回复中...” + 至少 1 行正文
+        header_lines = ["识别结果"] + user_lines
+        if len(header_lines) > max_header_lines:
+            header_lines = header_lines[:max_header_lines]
+        LCD_REPLY_START_LINE = len(header_lines)
+        _lcd_show_lines(header_lines)
 
         # 加入到对话历史
         message_history.append({
@@ -762,8 +947,15 @@ def main_loop():
             'type': 'answer'
         })
 
-        print('开始语音合成并播放...')
-        tts_play(answer, '/data/reply.wav')
+        tts_play(answer)
 
 if __name__ == '__main__':
     main_loop()
+    # message_history = []
+    # message_history.append({
+    #     'content': "你好",
+    #     'content_type': 'text',
+    #     'role': 'user',
+    #     'type': 'question'
+    # })    
+    # coze_chat(message_history)
