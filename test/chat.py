@@ -58,4 +58,18 @@ while True:
                             'type': data['type']
                             })
                         print('\n')
+                elif data_type == "conversation.chat.requires_action":
+                    data = json.loads(data[5:])
+                    tool_calls = data.get('required_action', {}).get('submit_tool_outputs', {}).get('tool_calls', [])
+                    for tool_call in tool_calls:
+                        function = tool_call.get('function', {})
+                        if function.get('name') == 'print':
+                            args = function.get('arguments', '{}')
+                            try:
+                                args_json = json.loads(args) if isinstance(args, str) else args
+                            except Exception:
+                                args_json = {}
+                            text = args_json.get('text', '')
+                            if text:
+                                print(text)
                         
