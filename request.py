@@ -195,11 +195,11 @@ def _parse_url(url):
 
 
 def _create_socket(host, port, timeout=5, use_ssl=False):
-    """创建并连接 socket，支持 SSL。返回的 socket 上挂了 _raw_sock 属性指向底层 socket。"""
+    """创建并连接 socket，支持 SSL"""
     ai = socket.getaddrinfo(host, port)
-    raw = socket.socket()
-    raw.settimeout(timeout)
-    raw.connect(ai[0][-1])
+    sock = socket.socket()
+    sock.settimeout(timeout)
+    sock.connect(ai[0][-1])
     if use_ssl:
         try:
             import ssl
@@ -207,22 +207,25 @@ def _create_socket(host, port, timeout=5, use_ssl=False):
             try:
                 import ussl as ssl
             except ImportError:
-                raw.close()
+                sock.close()
                 raise OSError('HTTPS 需要 ssl/ussl 模块')
         try:
-            sock = ssl.wrap_socket(raw, cert_reqs=ssl.CERT_NONE, server_hostname=host)
+            sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_NONE, server_hostname=host)
         except TypeError:
-            sock = ssl.wrap_socket(raw, cert_reqs=ssl.CERT_NONE)
-        sock._raw_sock = raw
-        return sock
-    return raw
+            sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_NONE)
+    return sock
 
 
-def _sock_recv(sock, n):
-    """兼容普通 socket 与 MicroPython SSLSocket（K230 SSL read 已按 settimeout 阻塞）"""
+def _sock_recv(sock, n, retries=1):
+    """兼容普通 socket 与 MicroPython SSLSocket。
+    retries: 最多尝试次数（每次阻塞 settimeout 秒），默认 1 次。
+    """
     if hasattr(sock, 'read'):
-        d = sock.read(n)
-        return d if d else b''
+        for _ in range(retries):
+            d = sock.read(n)
+            if d is not None and len(d) > 0:
+                return d
+        return b''
     return sock.recv(n)
 
 
@@ -315,11 +318,15 @@ def _get_header(headers_str, name):
     return ''
 
 
-def _read_response(sock):
-    """读取 HTTP 响应，支持 Content-Length / chunked / WAV 流式播放"""
+def _read_response(sock, first_retries=1):
+    """读取 HTTP 响应，支持 Content-Length / chunked / WAV 流式播放。
+    first_retries: 首次读取的重试次数，用于等待服务端处理（如 TTS 生成）。
+    """
     buf = b''
+    first = True
     while True:
-        chunk = _sock_recv(sock, 256)
+        chunk = _sock_recv(sock, 256, retries=first_retries if first else 1)
+        first = False
         if not chunk:
             break
         buf += chunk
@@ -596,9 +603,6 @@ def _read_wav_streaming(sock, body, content_length):
     compact_threshold = BUFFER_SIZE * 4
     max_bytes = BUFFER_SIZE * 8
 
-    raw = getattr(sock, '_raw_sock', sock)
-    raw.settimeout(5)
-
     audio_lock = _thread.allocate_lock()
     audio_state = {'buf': bytearray(body[0x2c:]), 'pos': 0, 'done': False}
 
@@ -633,8 +637,8 @@ def _read_wav_streaming(sock, body, content_length):
 
 # ─── HTTP 请求方法 ────────────────────────────────────────────────
 
-def post(url, headers, data, timeout=5):
-    return request(url, 'POST', headers, data, timeout)
+def post(url, headers, data, timeout=5, first_retries=1):
+    return request(url, 'POST', headers, data, timeout, first_retries)
 
 
 def get(url, headers=None, params=None, timeout=5):
@@ -643,7 +647,7 @@ def get(url, headers=None, params=None, timeout=5):
     return request(url, 'GET', headers or {}, '', timeout)
 
 
-def request(url, method, headers, data, timeout=5):
+def request(url, method, headers, data, timeout=5, first_retries=1):
     if headers is None:
         headers = {}
 
@@ -667,7 +671,7 @@ def request(url, method, headers, data, timeout=5):
     if body:
         _sock_send(sock, body)
 
-    response = _read_response(sock)
+    response = _read_response(sock, first_retries=first_retries)
     sock.close()
     return response
 
@@ -688,7 +692,7 @@ def coze_chat(message_history):
 
 def tts_play(text):
     """文本转语音并播放"""
-    timeout = max(5, len(text) // 5)
+    retries = max(1, len(text) // 20)
     payload = {
         'input': text,
         'voice_id': voice_id,
@@ -696,7 +700,7 @@ def tts_play(text):
         'sample_rate': 8000,
         'loudness_rate': -50,
     }
-    post(tts_url, _coze_headers(), payload, timeout=timeout)
+    post(tts_url, _coze_headers(), payload, first_retries=retries)
 
 
 def asr_from_wav(filename):
