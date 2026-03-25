@@ -195,11 +195,11 @@ def _parse_url(url):
 
 
 def _create_socket(host, port, timeout=5, use_ssl=False):
-    """创建并连接 socket，支持 SSL"""
+    """创建并连接 socket，支持 SSL。返回的 socket 上挂了 _raw_sock 属性指向底层 socket。"""
     ai = socket.getaddrinfo(host, port)
-    sock = socket.socket()
-    sock.settimeout(timeout)
-    sock.connect(ai[0][-1])
+    raw = socket.socket()
+    raw.settimeout(timeout)
+    raw.connect(ai[0][-1])
     if use_ssl:
         try:
             import ssl
@@ -207,13 +207,15 @@ def _create_socket(host, port, timeout=5, use_ssl=False):
             try:
                 import ussl as ssl
             except ImportError:
-                sock.close()
+                raw.close()
                 raise OSError('HTTPS 需要 ssl/ussl 模块')
         try:
-            sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_NONE, server_hostname=host)
+            sock = ssl.wrap_socket(raw, cert_reqs=ssl.CERT_NONE, server_hostname=host)
         except TypeError:
-            sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_NONE)
-    return sock
+            sock = ssl.wrap_socket(raw, cert_reqs=ssl.CERT_NONE)
+        sock._raw_sock = raw
+        return sock
+    return raw
 
 
 def _sock_recv(sock, n):
@@ -594,7 +596,8 @@ def _read_wav_streaming(sock, body, content_length):
     compact_threshold = BUFFER_SIZE * 4
     max_bytes = BUFFER_SIZE * 8
 
-    sock.settimeout(5)
+    raw = getattr(sock, '_raw_sock', sock)
+    raw.settimeout(5)
 
     audio_lock = _thread.allocate_lock()
     audio_state = {'buf': bytearray(body[0x2c:]), 'pos': 0, 'done': False}
