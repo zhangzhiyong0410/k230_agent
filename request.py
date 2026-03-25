@@ -545,18 +545,11 @@ def _read_chunked_raw(sock, initial=b''):
 def _wav_recv_worker(_sock, _lock, _state, _content_length, _initial_len, _max_bytes):
     """网络接收线程：从 socket 读取 WAV 数据写入共享缓冲区"""
     total = _initial_len
-    empty_streak = 0
-    MAX_EMPTY = 10
     try:
         while _content_length is not None and total < _content_length:
             chunk = _sock_recv(_sock, min(2048, _content_length - total))
             if not chunk:
-                empty_streak += 1
-                if empty_streak >= MAX_EMPTY:
-                    break
-                time.sleep_ms(20)
-                continue
-            empty_streak = 0
+                break
             total += len(chunk)
             while True:
                 with _lock:
@@ -600,6 +593,8 @@ def _read_wav_streaming(sock, body, content_length):
     BUFFER_SIZE = CHUNK * framesize
     compact_threshold = BUFFER_SIZE * 4
     max_bytes = BUFFER_SIZE * 8
+
+    sock.settimeout(5)
 
     audio_lock = _thread.allocate_lock()
     audio_state = {'buf': bytearray(body[0x2c:]), 'pos': 0, 'done': False}
