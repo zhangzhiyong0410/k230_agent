@@ -217,7 +217,7 @@ def _create_socket(host, port, timeout=5, use_ssl=False):
 
 
 def _sock_recv(sock, n):
-    """兼容普通 socket 与 MicroPython SSLSocket，单次读取"""
+    """兼容普通 socket 与 MicroPython SSLSocket（K230 SSL read 已按 settimeout 阻塞）"""
     if hasattr(sock, 'read'):
         d = sock.read(n)
         return d if d else b''
@@ -690,6 +690,7 @@ def coze_chat(message_history):
 
 def tts_play(text):
     """文本转语音并播放"""
+    timeout = max(5, len(text) // 5)
     payload = {
         'input': text,
         'voice_id': voice_id,
@@ -697,7 +698,7 @@ def tts_play(text):
         'sample_rate': 8000,
         'loudness_rate': -50,
     }
-    post(tts_url, _coze_headers(), payload, timeout=3)
+    post(tts_url, _coze_headers(), payload, timeout=timeout)
 
 
 def asr_from_wav(filename):
