@@ -108,6 +108,7 @@ def _audio_playback_worker(_lock, _state, _stream, _p, _framesize, _buf_size, _c
 
             if block:
                 _stream.write(block)
+                time.sleep_ms(1)
             else:
                 time.sleep_ms(5)
     except Exception as e:
@@ -215,18 +216,11 @@ def _create_socket(host, port, timeout=5, use_ssl=False):
     return sock
 
 
-def _sock_recv(sock, n, _retries=50):
-    """兼容普通 socket 与 MicroPython SSLSocket"""
+def _sock_recv(sock, n):
+    """兼容普通 socket 与 MicroPython SSLSocket，单次读取"""
     if hasattr(sock, 'read'):
-        for _ in range(_retries):
-            d = sock.read(n)
-            if d is not None and len(d) > 0:
-                return d
-            try:
-                time.sleep_ms(100)
-            except Exception:
-                time.sleep(0.1)
-        return b''
+        d = sock.read(n)
+        return d if d else b''
     return sock.recv(n)
 
 
@@ -548,8 +542,37 @@ def _read_chunked_raw(sock, initial=b''):
     return body
 
 
+def _wav_recv_worker(_sock, _lock, _state, _content_length, _initial_len, _max_bytes):
+    """网络接收线程：从 socket 读取 WAV 数据写入共享缓冲区"""
+    total = _initial_len
+    empty_streak = 0
+    MAX_EMPTY = 10
+    try:
+        while _content_length is not None and total < _content_length:
+            chunk = _sock_recv(_sock, min(2048, _content_length - total))
+            if not chunk:
+                empty_streak += 1
+                if empty_streak >= MAX_EMPTY:
+                    break
+                time.sleep_ms(20)
+                continue
+            empty_streak = 0
+            total += len(chunk)
+            while True:
+                with _lock:
+                    if len(_state['buf']) - _state['pos'] + len(chunk) <= _max_bytes:
+                        _state['buf'].extend(chunk)
+                        break
+                time.sleep_ms(5)
+    except Exception as e:
+        print('WAV 接收线程异常:', e)
+    finally:
+        with _lock:
+            _state['done'] = True
+
+
 def _read_wav_streaming(sock, body, content_length):
-    """边接收边播放 WAV 音频"""
+    """边接收边播放 WAV 音频，网络接收和音频播放各在独立线程"""
     WAV_HEADER_MIN = 0x2c
     while len(body) < WAV_HEADER_MIN:
         remain = max(0, content_length - len(body)) if content_length else 512
@@ -590,25 +613,22 @@ def _read_wav_streaming(sock, body, content_length):
     stream.volume(vol=85)
 
     _thread.start_new_thread(
+        _wav_recv_worker,
+        (sock, audio_lock, audio_state, content_length, len(body), max_bytes),
+    )
+
+    _thread.start_new_thread(
         _audio_playback_worker,
         (audio_lock, audio_state, stream, p, framesize, BUFFER_SIZE, compact_threshold),
     )
 
-    total_received = len(body)
-    while content_length is not None and total_received < content_length:
-        chunk = _sock_recv(sock, min(512, content_length - total_received))
-        if not chunk:
+    while True:
+        with audio_lock:
+            done = audio_state['done']
+            available = len(audio_state['buf']) - audio_state['pos']
+        if done and available <= 0:
             break
-        total_received += len(chunk)
-        while True:
-            with audio_lock:
-                if len(audio_state['buf']) - audio_state['pos'] + len(chunk) <= max_bytes:
-                    audio_state['buf'].extend(chunk)
-                    break
-            time.sleep_ms(5)
-
-    with audio_lock:
-        audio_state['done'] = True
+        time.sleep_ms(50)
 
     return body
 
