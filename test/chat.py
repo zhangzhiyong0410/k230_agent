@@ -2,6 +2,10 @@ import requests
 import json
 import socket
 import threading
+import websocket
+import base64
+import pyaudio
+import time
 
 chat_message = ""
 shutdown_event = threading.Event()
@@ -12,12 +16,73 @@ authorization = 'Bearer pat_JrYrSPfHItMZUfpFEuwp3GEqqPM5OQXI5ftAqbYGd3XNSCVkBnuM
 
 Paragraph_marks = ['，','。','？','！','～']
 
+TTS_URL = "wss://tts_ws.coze.cn/v1/audio/speech"
+
 url = 'https://api.coze.cn/v3/chat?'
 
 headers = {
     'Authorization': authorization,
     'Content-Type': 'application/json'
 }
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 24000
+
+tts_thread = None
+
+tts_text = ""
+
+tts_send_id = 0
+
+def on_open(tts_ws):
+    print("✅ tts websocket 连接成功")
+
+def on_message(tts_ws, message):
+    try:
+        data = json.loads(message)
+        
+        # 只处理音频数据
+        if data.get("event_type") == "speech.audio.update":
+            delta_b64 = data["data"]["delta"]
+            # 1. Base64 解码 → PCM 二进制音频
+            pcm_data = base64.b64decode(delta_b64)
+            print(pcm_data[0:10])
+            # 2. 实时播放
+            #stream.write(pcm_data)
+
+    except Exception as e:
+        print("on_message error: ", e)
+
+# ===================== 启动 WebSocket =====================
+tts_ws = websocket.WebSocketApp(
+    TTS_URL,
+    header=headers,
+    on_open=on_open,
+    on_message=on_message,
+)
+
+def ws_thread():
+    tts_ws.run_forever()
+
+def connect():
+    global tts_ws
+    try:
+        tts_ws.close()
+        tts_thread.stop()
+        time.sleep(0.5)
+    except:
+        pass
+
+    tts_ws = websocket.WebSocketApp(
+        TTS_URL, header=HEADERS,
+        on_open=on_open, on_message=on_message
+    )
+    tts_thread = threading.Thread(target=tts_ws.run_forever, daemon=True)
+    tts_thread.start()
+    
+    print("✅ 连接成功")
+
 message_history = [
     # {
     #     'content': '你好',
@@ -40,7 +105,7 @@ payload = {
 HTTP_TIMEOUT = (30, 120)
 
 def chat():
-    global chat_message
+    global chat_message, tts_text, tts_ws
     while not shutdown_event.is_set():
         if chat_message == "":
             shutdown_event.wait(0.1)
@@ -75,10 +140,36 @@ def chat():
                     elif data[0:4] == "data":
                         if data_type == "conversation.message.delta":
                             data = json.loads(data[5:])
-                            print(data['content'], end='', flush=True)
+                            #print(data['content'])
+                            send_msg = {
+                                "id": str(tts_send_id),
+                                "event_type": "input_text_buffer.append",
+                                "data": {"delta": data['content']}
+                            }
+                            tts_ws.send(json.dumps(send_msg))
+                            tts_text += data['content']
+                            index = 0
+                            #print(tts_text)
+                            while True:
+                                if index == len(tts_text):
+                                    break
+                                if tts_text[index] in Paragraph_marks:
+                                    end_msg = {
+                                        "id": str(tts_send_id),
+                                        "event_type": "input_text_buffer.complete"
+                                    }
+                                    tts_ws.send(json.dumps(end_msg))
+                                    tts_ += 1
+                                    print(tts_text[:index+1])
+                                    tts_text = tts_text[index+1:]
+                                    break
+                                index += 1
                         elif data_type == "conversation.message.completed":
                             data = json.loads(data[5:])
+                            
                             if data['type'] == "answer":
+                                print("answer")
+                                print(data['content'])
                                 message_history.append({
                                     'content': data['content'],
                                     'content_type': data['content_type'],
@@ -136,7 +227,8 @@ def start_server():
     server_socket.listen(5)
     server_socket.settimeout(1.0)
     print(f"[启动] 多线程TCP服务端，端口 {PORT}（Ctrl+C 退出）")
-
+    tts_thread = threading.Thread(target=ws_thread, daemon=True)
+    tts_thread.start()
     chat_thread = threading.Thread(target=chat, daemon=True, name="chat")
     chat_thread.start()
 
